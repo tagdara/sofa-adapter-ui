@@ -1,0 +1,4 @@
+aiohttp
+aiohttp_sse
+aiohttp_cors
+pyjwt
