@@ -99,8 +99,9 @@ class User:
             
 class sofaWebUI():
     
-    def __init__(self, config=None, loop=None, log=None, request=None, dataset=None, notify=None, discover=None, adapter=None):
+    def __init__(self, config=None, users=None, loop=None, log=None, request=None, dataset=None, notify=None, discover=None, adapter=None):
         self.config=config
+        self.users=users
         self.log=log
         self.loop = loop
         self.request=request
@@ -134,8 +135,8 @@ class sofaWebUI():
     async def initialize(self):
 
         try:
-            for user in self.dataset.config['users']:
-                User.objects.create(email=user, password=self.dataset.config['users'][user])
+            for user in self.users:
+                User.objects.create(email=self.users[user]['email'], password=self.users[user]['password'], is_admin=self.users[user]['admin'])
             
             self.serverAddress=self.config['web_address']
             self.serverApp = web.Application(middlewares=[self.auth_middleware])
@@ -151,6 +152,7 @@ class sofaWebUI():
             self.cors.add(self.serverApp.router.add_get('/logout', self.logout_handler))
             self.cors.add(self.serverApp.router.add_post('/login', self.login_post))
             self.cors.add(self.serverApp.router.add_get('/get-user', self.get_user))
+            self.cors.add(self.serverApp.router.add_post('/save-user', self.save_user))
             self.serverApp.router.add_get('/loginstatus', self.login_status_handler)
             self.serverApp.router.add_get('/index.html', self.root_handler)
             self.serverApp.router.add_get('/status', self.status_handler)
@@ -174,9 +176,9 @@ class sofaWebUI():
             self.serverApp.router.add_post('/deviceState', self.deviceStatePostHandler)
             self.cors.add(self.serverApp.router.add_post('/directive', self.directiveHandler))
             
-            self.serverApp.router.add_post('/add/{add:.+}', self.adapterAddHandler)
-            self.serverApp.router.add_post('/del/{del:.+}', self.adapterDelHandler)   
-            self.serverApp.router.add_post('/save/{save:.+}', self.adapterSaveHandler)
+            self.cors.add(self.serverApp.router.add_post('/add/{add:.+}', self.adapterAddHandler))
+            self.cors.add(self.serverApp.router.add_post('/del/{del:.+}', self.adapterDelHandler))  
+            self.cors.add(self.serverApp.router.add_post('/save/{save:.+}', self.adapterSaveHandler))
             
             self.serverApp.router.add_get('/displayCategory/{category:.+}', self.displayCategoryHandler)
             self.cors.add(self.serverApp.router.add_get('/image/{item:.+}', self.imageHandler))
@@ -224,7 +226,7 @@ class sofaWebUI():
                                 jwt_token=request.cookies['token']
                         except:
                             self.log.error('.! could not get jwt token from cookies', exc_info=True)
-            
+
                     if not jwt_token:                        
                         # CHEESE: There is probably a better way to get this information, but this is a shim for EventSource not being able
                         # to send an Authorization header from the client side.  It also does not appear send cookies in the normal way
@@ -237,7 +239,7 @@ class sofaWebUI():
                                         jwt_token=hcookie.split('=')[1]
                         except:
                             self.log.error('Could not decipher token from header cookies', exc_info=True)
-                 
+
                     if jwt_token:
                         try:
                             payload = jwt.decode(jwt_token, self.JWT_SECRET,
@@ -250,12 +252,13 @@ class sofaWebUI():
                         self.log.warn('.- No token available for user. Path: %s' % request.rel_url)
                         self.log.warn('-- Headers: %s' % request.headers)
                         return self.json_response({'message': 'Token is missing'}, status=400)
+
                 return await handler(request)
             except aiohttp.web_exceptions.HTTPNotFound:
                 # 404's
                 pass
             except:
-                self.log.error('!! error with jwt middleware handler', exc_info=True)
+                self.log.error('!! error with jwt middleware handler: %s %s' % ( request.method, request.rel_url), exc_info=True)
 
         return middleware
     
@@ -269,34 +272,60 @@ class sofaWebUI():
     def json_response(self, body='', **kwargs):
         try:
             kwargs['body'] = json.dumps(body or kwargs['body']).encode('utf-8')
-            kwargs['content_type'] = 'text/json'
+            kwargs['content_type'] = 'application/json'
             return web.Response(**kwargs)
         except:
             self.log.error('!! error with json response', exc_info=True)
             return web.Response({'body':''})
 
     async def get_user(self, request):
+        for user in self.users:
+            if self.users[user]['email']==request.user.email:
+                return self.json_response( self.users[user]['data'] )
         return self.json_response({'user': str(request.user)})
+
+    async def save_user(self, request):
+        try:
+            if request.body_exists:
+                for user in self.users:
+                    if self.users[user]['email']==request.user.email:
+                        body=await request.read()
+                        data=json.loads(body.decode())
+                        self.users[user]['data']=data
+                        self.adapter.saveJSON('users',self.users)
+                        return self.json_response( self.users[user]['data'])
+        except:
+            self.log.error('!! Error saving user data', exc_info=True)
+        return self.json_response({'error':'could not save'})
+
     
     async def login_post(self, request):
         try:
             post_data = await request.post()
-            #self.log.info('Login request for %s' % data)
+            self.log.info('Login request for %s' % post_data)
             try:
                 postuser=str(post_data['user']).lower()
+                
                 user = User.objects.get(email=postuser)
                 user.match_password(post_data['password'])
-            except (User.DoesNotExist, User.PasswordDoesNotMatch):
-                return self.json_response({'message': 'Wrong credentials'}, status=400)
-        
+            except User.DoesNotExist:
+                self.log.info('.. incorrect user: %s' % postuser)
+                return self.json_response({'message': 'User does not exist'}, status=400)
+            except User.PasswordDoesNotMatch:
+                self.log.info('.. incorrect password: %s' % post_data['password'])
+                return self.json_response({'message': 'Incorrect password'}, status=400)
+            
+            self.log.info('generating token with %s' % user.id)
             payload = {
                 'user_id': user.id,
                 'exp': datetime.datetime.utcnow() + datetime.timedelta(seconds=self.JWT_EXP_DELTA_SECONDS)
             }
             jwt_token = jwt.encode(payload, self.JWT_SECRET, self.JWT_ALGORITHM)
+            self.log.info('generated token %s' % jwt_token)
             return self.json_response({'token': jwt_token.decode('utf-8')})
         except:
             self.log.error('!! error with login post', exc_info=True)
+            return self.json_response({'token': ""})
 
     # End - This is the JWT testing code       
     
@@ -385,8 +414,9 @@ class sofaWebUI():
             self.log.error('Error in login process', exc_info=True)
 
     async def layoutHandler(self, request):
-        if not self.layout:
-            self.layout=await self.layoutUpdate()
+        #if not self.layout:
+        #    self.layout=
+        self.layout=await self.layoutUpdate()
             
         return web.Response(content_type="text/html", body=json.dumps(json.loads(self.layout)))
 
@@ -549,7 +579,9 @@ class sofaWebUI():
 
         try:
             fullitem="%s?%s" % (request.match_info['item'], request.query_string)
+            #self.log.info('.. image request: %s (%s)' % (fullitem, request.query_string))
             if fullitem in self.imageCache:
+                self.log.info('.. image from cache')
                 result=base64.b64decode(self.imageCache[fullitem][23:])
                 return web.Response(body=result, headers = { "Content-type": "image/jpeg" })
             
@@ -614,6 +646,8 @@ class sofaWebUI():
                 result={}
                 outputData={}
                 body=await request.read()
+                body=body.decode()
+                self.log.info('list post request: %s' % (body))
                 #item="%s?%s" % (request.match_info['list'], request.query_string)
                 item=request.match_info['list']
                 source=item.split('/',1)[0] 
@@ -625,11 +659,10 @@ class sofaWebUI():
                         async with client.post(url, data=body) as response:
                             result=await response.read()
                             result=result.decode()
-                
             except:
                 self.log.error('Error transferring command: %s' % body,exc_info=True)
-
-        return web.Response(text=result)
+        
+        return self.json_response(result)
 
     async def varHandler(self, request):
 
@@ -645,19 +678,20 @@ class sofaWebUI():
                 url = 'http://%s:%s/var/%s' % (self.dataset.adapters[source]['address'], self.dataset.adapters[source]['port'], item.split('/',1)[1] )
                 async with aiohttp.ClientSession() as client:
                     async with client.get(url) as response:
-                        result=await response.read()
-                        result=result.decode()
+                        result=await response.json()
+                        #result=result.decode()
             else:
                 self.log.error('Source not in adapters: %s %s' % (source, self.dataset.adapters))
 
-            return web.Response(text=result)
+            return self.json_response(result)
+            #return web.Response(text=result)
 
         except concurrent.futures._base.CancelledError:
             self.log.error('Error getting list data %s (cancelled)' % item)
-            return web.Response(text='')
+            return self.json_response({})
         except:
             self.log.error('Error getting list data %s' % item, exc_info=True)
-            return web.Response(text='')
+            return self.json_response({})
 
 
     async def adapterSaveHandler(self, request):
@@ -686,27 +720,28 @@ class sofaWebUI():
 
     async def adapterDelHandler(self, request):
             
-        if request.body_exists:
-            try:
-                outputData={}
+        try:
+            outputData={}   
+            body=""
+            if request.body_exists:
                 body=await request.read()
-                #item="%s?%s" % (request.match_info['del'], request.query_string)
-                item=request.match_info['del']
-                source=item.split('/',1)[0] 
-                if source in self.dataset.adapters:
-                    result='#'
-                    url = 'http://%s:%s/del/%s' % (self.dataset.adapters[source]['address'], self.dataset.adapters[source]['port'], item.split('/',1)[1] )
-                    self.log.info('Posting Delete Data to: %s' % url)
-                    async with aiohttp.ClientSession() as client:
-                        async with client.post(url, data=body) as response:
-                            result=await response.read()
-                            result=result.decode()
-                            self.log.info('resp: %s' % result)
-                
-            except:
-                self.log.error('Error transferring command: %s' % body,exc_info=True)
+            #item="%s?%s" % (request.match_info['del'], request.query_string)
+            item=request.match_info['del']
+            source=item.split('/',1)[0] 
+            if source in self.dataset.adapters:
+                result='#'
+                url = 'http://%s:%s/del/%s' % (self.dataset.adapters[source]['address'], self.dataset.adapters[source]['port'], item.split('/',1)[1] )
+                self.log.info('Posting Delete Data to: %s' % url)
+                async with aiohttp.ClientSession() as client:
+                    async with client.post(url, data=body) as response:
+                        result=await response.read()
+                        result=result.decode()
+                        self.log.info('resp: %s' % result)
+            
+        except:
+            self.log.error('Error transferring command: %s' % body,exc_info=True)
 
-            return web.Response(text=result)
+        return web.Response(text=result)
 
     async def adapterAddHandler(self, request):
             
@@ -1012,6 +1047,7 @@ class ui(sofabase):
     class adapterProcess(SofaCollector.collectorAdapter):
 
         def __init__(self, log=None, loop=None, dataset=None, notify=None, discover=None, request=None,  **kwargs):
+            self.uiServer=None
             self.dataset=dataset
             self.config=self.dataset.config
             self.log=log
@@ -1023,7 +1059,8 @@ class ui(sofabase):
             
         async def start(self):
             self.log.info('.. Starting ui server')
-            self.uiServer = sofaWebUI(config=self.config, loop=self.loop, log=self.log, request=self.request, dataset=self.dataset, notify=self.notify, discover=self.discover, adapter=self)
+            self.users=self.loadJSON("users")
+            self.uiServer = sofaWebUI(config=self.config, users=self.users, loop=self.loop, log=self.log, request=self.request, dataset=self.dataset, notify=self.notify, discover=self.discover, adapter=self)
             await self.uiServer.initialize()
             #await self.discover('sofa')
 
@@ -1040,7 +1077,7 @@ class ui(sofabase):
         
             try:
                 await super().handleAddOrUpdateReport(message)
-                if message:
+                if message and self.uiServer:
                     try:
                         #if 'log_change_reports' in self.dataset.config:
                         self.log.info('-> SSE %s %s' % (message['event']['header']['name'],message))
