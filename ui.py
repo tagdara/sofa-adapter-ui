@@ -49,7 +49,7 @@ class sofaWebUI():
     async def initialize(self):
 
         try:
-            self.auth=Auth(secret=self.config.token_secret, log=self.log, token_expires=self.config.token_expires)
+            self.auth=Auth(secret=self.config.token_secret, log=self.log, token_expires=self.config.token_expires, config_dir=self.config.cache_directory)
             self.users=self.adapter.loadJSON("users")
             for user in self.users:
                 User.objects.create(login=user, email=self.users[user]['email'], password=self.users[user]['password'], is_admin=self.users[user]['admin'])
