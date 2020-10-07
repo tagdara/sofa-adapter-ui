@@ -60,6 +60,7 @@ class sofaWebUI():
             self.serverApp.router.add_get('/sse', self.sse_handler)
             
             self.serverApp.router.add_get('/', self.root_handler)
+            self.serverApp.router.add_post('/', self.event_gateway_handler)
             self.serverApp.router.add_post('/auth/o2/token', self.refresh_token_post_handler) # This is the URL that Amazon Alexa uses
             self.serverApp.router.add_post('/login', self.login_post_handler)
             self.serverApp.router.add_get('/logout', self.logout_handler)
@@ -68,8 +69,8 @@ class sofaWebUI():
             self.serverApp.router.add_get('/layout', self.layoutHandler)
             self.serverApp.router.add_get('/properties', self.propertiesHandler)
             self.serverApp.router.add_get('/user', self.get_user)
-            
-            self.serverApp.router.add_post('/directive', self.directiveHandler)
+            self.serverApp.router.add_post('/user/save', self.save_user)
+
             self.serverApp.router.add_get('/devices', self.device_list_handler)
             self.serverApp.router.add_post('/register_devices', self.register_device_handler)
             
@@ -84,10 +85,7 @@ class sofaWebUI():
             self.serverApp.router.add_get('/thumbnail/{item:.+}', self.imageHandler)
             
             self.serverApp.router.add_get('/video/{camera:.+}', self.video_handler)
-            
-            self.serverApp.router.add_get('/get-user', self.get_user)
-            self.serverApp.router.add_post('/save-user', self.save_user)
-            
+
             if os.path.isdir(self.config.client_build_directory):
                 self.serverApp.router.add_static('/client', path=self.config.client_build_directory, append_version=True)
                 self.serverApp.router.add_static('/fonts', path=self.config.client_build_directory+"/fonts", append_version=True)
@@ -184,14 +182,15 @@ class sofaWebUI():
             body=await request.read()
             body=body.decode()
             post_data=json.loads(body)
-            self.log.info('.. refresh token request for %s' % post_data)
+            self.log.info('<- %s/%s refresh token request for %s' % (self.get_ip(request), post_data['user'], post_data['refresh_token'][:10]))
             postuser=str(post_data['user']).lower()
             refresh_token=str(post_data['refresh_token']).lower()
             check=await self.auth.get_token_from_refresh(postuser, post_data['refresh_token'])
         except:
-            self.log.error('!! error with login post', exc_info=True)
+            self.log.error('<! %s/? error with login post' % self.get_ip(request), exc_info=True)
             check=False
         if check:
+            self.log.info('-> %s/%s returning access token %s' % (self.get_ip(request), post_data['user'], check[:10]))
             return self.json_response({'access_token': check})
 
         raise web.HTTPUnauthorized()
@@ -290,25 +289,53 @@ class sofaWebUI():
         properties=await self.dataset.getAllProperties()
         return self.json_response(properties)
         
-
-    async def directiveHandler(self, request):
-        
-        # Take alexa directive commands such as 'TurnOn' or 'SelectInput'
+    async def event_gateway_handler(self, request):
         response={}
-        
+        body={}
         try:
             if request.body_exists:
                 body=await request.read()
-                data=json.loads(body.decode())
+                body=body.decode()
+                #post_data = await request.post()
+                data=json.loads(body)
                 if 'directive' in data:
-                    self.log.info("<- %s %s %s/%s" % (self.get_ip(request), data['directive']['header']['name'], data['directive']['endpoint']['endpointId'], data['directive']['header']['namespace'].split('.')[1]))
-
-                    #self.log.info('<- %s %s: %s' % (self.get_ip(request), data['directive']['header']['name'], data))
-                    response=await self.dataset.sendDirectiveToAdapter(data)
+                    if data['directive']['header']['name']=='Discover':
+                        self.log.info("<- %s/%s %s" % (self.get_ip(request), request.user.login, data['directive']['header']['name']))
+                        response=await self.dataset.discovery(remote=True)
+                        self.log.info('-> %s/%s Discovery.Response' % (self.get_ip(request), request.user.login))
+                    else:
+                        self.log.info("<- %s/%s %s %s/%s" % (self.get_ip(request), request.user.login, data['directive']['header']['name'], data['directive']['endpoint']['endpointId'], data['directive']['header']['namespace'].split('.')[1]))
+                        response=await self.dataset.sendDirectiveToAdapter(data)
+                    
                     return self.json_response(response)
         except:
-            self.log.error('Error transferring directive: %s' % body,exc_info=True)
-        return self.json_response({})
+            self.log.error('!! Error handling event gateway directive: %s' % body,exc_info=True)
+        return self.json_response({}) # Should return error response, not empty
+                        
+
+    async def discovery_data(self, resp, remote_ip, devicelist=None):
+        try:
+            outlist=[]
+            byadapter={}
+            
+            # Carving this up by adapter to deal with the 128k size limitation issues with aiohttp_sse
+            # Data updates were already by adapter due to the way we request information
+            # https://github.com/rtfol/aiohttp-sse-client/issues/11
+            
+            if not devicelist:
+                devicelist=self.dataset.devices
+            
+            for dev in devicelist:
+                dei=self.dataset.devices[dev]['endpointId'].split(':')[0]
+                if dei not in byadapter:
+                    byadapter[dei]=[]
+                byadapter[dei].append(self.dataset.devices[dev])
+            for adapter in byadapter:
+                aou={"event": { "header": { "namespace": "Alexa.Discovery", "name": "AddOrUpdateReport", "payloadVersion": "3", "messageId": str(uuid.uuid1()) }, "payload": {"endpoints": byadapter[adapter]}}}
+                await resp.send(json.dumps(aou, default=self.date_handler))
+            self.log.info('-> %s devicelist' % remote_ip)
+        except:
+            self.log.error('!! SSE Error transferring list of devices',exc_info=True)
         
 
     async def listHandler(self, request):
@@ -372,7 +399,7 @@ class sofaWebUI():
         try:
             if not self.dataset.token:
                 return None
-
+            
             reqstart=datetime.datetime.now()
             source=item.split('/',1)[0] 
             result='#'
@@ -387,6 +414,8 @@ class sofaWebUI():
             async with aiohttp.ClientSession(connector=self.gateway_conn, connector_owner=False, timeout=timeout) as client:
                 async with client.get(url, headers=headers) as response:
                     result=await response.read()
+                    if "{" in str(result)[:10]:
+                        self.log.info('.. error getting image %s' % result.decode())
                     return result
                     #result=result.decode()
                     if str(result)[:10]=="data:image":
@@ -427,9 +456,9 @@ class sofaWebUI():
                 return aiohttp.web.Response(body=result, headers = { "Content-type": "image/jpeg" })
             
             self.log.info('Did not get an image to return for %s: %s' % (request.match_info['item'], str(result)[:10]))
-            return aiohttp.web.Response(content_type="text/html", body='')
         except:
             self.log.error('Error with image handler', exc_info=True)
+        return aiohttp.web.Response(content_type="text/html", body='Error - no image returned')
 
 
 
@@ -569,38 +598,60 @@ class sofaWebUI():
         result={} 
         if request.body_exists:
             try:
-                result={}
                 outputData={}
                 body=await request.read()
                 body=body.decode()
                 data=json.loads(body)
+                
                 if 'remove' in data and len(data['remove'])>0:
-                    #self.log.info('>> unregister devices for %s/%s: %s' % (request.user.login, request.session, data['remove']))
                     for item in data['remove']:
                         if item in self.session_device_filter[request.session]:    
                             self.session_device_filter[request.session].remove(item)
                 
                 if 'add' in data and len(data['add'])>0:
-                    #self.log.info('>> register devices for %s/%s: %s' % (request.user.login, request.session, data['add']))
                     if request.session in self.session_device_filter:
                         for item in data['add']:
                             if item not in self.session_device_filter[request.session]:
                                 self.session_device_filter[request.session].append(item)
                     else:
                         self.session_device_filter[request.session]=data['add']
-                
-                # TODO/CHEESE: Pulling data is a multi-part async operation that does not handle a single return well
-                # Requiring SSE as the dump until we sort out how to make it better
-                
-                if request.session in self.active_sse:
-                    result = await self.sseDataUpdater(self.active_sse[request.session], devicelist=data['add'])
-                else:
-                    self.log.warning('!! no current SSE for %s' % request.session)
-                #item="%s?%s" % (request.match_info['list'], request.query_string)
+
+                    result=await self.register_data_updater(data['add'])
+
             except:
-                self.log.error('Error transferring command: %s' % body,exc_info=True)
+                self.log.error('!! Error registering devices: %s' % body,exc_info=True)
         
         return self.json_response(result)
+
+
+    async def register_data_updater(self, devicelist):
+        try:
+            devoutput={}
+            req_start=datetime.datetime.now()
+
+            if devicelist:
+                getByAdapter={} 
+                for dev in devicelist:
+                    adapter=dev.split(':')[0]
+                    if adapter not in getByAdapter:
+                        getByAdapter[adapter]=[]
+                    getByAdapter[adapter].append(dev)
+                    
+                gfa=[]
+
+                results=await self.adapter.request_state_reports(devicelist)
+                return results
+                devoutput={"event": { "header": { "name": "Multistate" }}, "state": {}}
+                for item in results:
+                    devoutput["state"].update(item)
+
+        except concurrent.futures._base.CancelledError:
+            self.log.warn('.. register data update cancelled. %s' % devoutput)
+                    
+        except:
+            self.log.error('Error sse list of devices', exc_info=True)
+            
+        return devoutput
 
 
     @login_required
@@ -612,31 +663,31 @@ class sofaWebUI():
             if self.get_ip(request) not in self.active_sessions:
                 self.active_sessions[sessionid]=self.get_ip(request)
 
-            self.log.info('++ SSE started for %s/%s' % (self.get_ip(request), request.user))
+            self.log.info('++ %s/%s SSE stream started' % (self.get_ip(request), request.user.login))
             
             client_sse_date=datetime.datetime.now(datetime.timezone.utc)
             async with sse_response(request) as resp:
                 self.active_sse[sessionid]=resp
-                await self.sseDeviceUpdater(resp, self.get_ip(request))
-                #if sessionid not in self.session_device_filter:
-                #    self.log.info('!! WARNING - session not in filter: %s' % sessionid)
-                #    await self.sseDataUpdater(resp)
-                #self.log.info('.. initial SSE data load complete')
-
+                
+                ## TODO/CHEESE 10/4/20 - Users should request devices with the Discover directive instead of just having them delivered
+                ## at the beginning of an SSE session automatically. This should prevent some of the crazy update times when adapters have been
+                ## reset, but needs further testing
+                
+                # await self.sseDeviceUpdater(resp, self.get_ip(request))
+                
                 while self.adapter.running:
                     if self.sse_last_update>client_sse_date:
-                        if request.collector:
-                            sendupdates=[]
-                            for update in reversed(self.sse_updates):
-                                if update['date']>client_sse_date:
-                                    filtered=await self.filterUpdate(update['message'], sessionid)
-                                    if filtered:
-                                        sendupdates.append(filtered)
-                                else:
-                                    break
-                            for update in reversed(sendupdates):
-                                #self.log.info('Sending SSE update: %s' % update )
-                                await resp.send(json.dumps(update))
+                        sendupdates=[]
+                        for update in reversed(self.sse_updates):
+                            if update['date']>client_sse_date:
+                                filtered=await self.filterUpdate(update['message'], sessionid)
+                                if filtered:
+                                    sendupdates.append(filtered)
+                            else:
+                                break
+                        for update in reversed(sendupdates):
+                            #self.log.info('Sending SSE update: %s' % update )
+                            await resp.send(json.dumps(update))
                         client_sse_date=self.sse_last_update
                         
                     if client_sse_date<datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=10):
@@ -649,11 +700,11 @@ class sofaWebUI():
                 del self.active_sse[sessionid]
             return resp
         except concurrent.futures._base.CancelledError:
-            self.log.info('-- SSE closed for %s/%s' % (self.get_ip(request), remoteuser))
+            self.log.info('-- %s/%s SSE stream closed' % (self.get_ip(request), request.user.login))
             del self.active_sessions[sessionid]
             return resp
         except:
-            self.log.error('!! Error in SSE loop for %s/%s' % (self.get_ip(request), remoteuser), exc_info=True)
+            self.log.error('!! %s/%s SSE stream error' % (self.get_ip(request), request.user.login), exc_info=True)
             del self.active_sessions[sessionid]
             return resp
 
@@ -737,9 +788,14 @@ class sofaWebUI():
                 
             gfa=[]
             
-            for adapter in getByAdapter:
-                #self.log.info('.. getting states for %s' % adapter)
-                gfa.append(self.dataset.requestReportStates(getByAdapter[adapter]))
+            #for adapter in getByAdapter:
+            #    #self.log.info('.. getting states for %s' % adapter)
+            #    gfa.append(self.dataset.requestReportStates(getByAdapter[adapter]))
+            
+            self.log.info('.. getting states for %s items' % len(devicelist))
+            for dev in devicelist:
+                gfa.append(self.dataset.requestReportState(dev))
+
                 
             for f in asyncio.as_completed(gfa):
                 devstate = await f  # Await for next result.
@@ -762,8 +818,6 @@ class sofaWebUI():
 
     def add_sse_update(self, message):
         try:
-            
-            #self.log.info('add sse: %s' % message)
             clearindex=0
             for i,update in enumerate(self.sse_updates):
                 if update['date']<datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=120):
@@ -824,6 +878,17 @@ class ui(sofabase):
                         if self.config.log_changes:
                             self.log.info('-> SSE %s %s' % (message['event']['header']['name'],message))
                         self.uiServer.add_sse_update(message)
+                        
+                        update_devs=[]
+                        for dev in message['event']['payload']['endpoints']:
+                            if dev['endpointId'] in self.state_cache:
+                                del self.state_cache[dev['endpointId']]
+                            for session in self.uiServer.session_device_filter:
+                                if dev['endpointId'] in self.uiServer.session_device_filter[session]:
+                                    update_devs.append(dev['endpointId'])
+                        if update_devs:
+                            results=await self.request_state_reports(update_devs)
+                            
                     except:
                         self.log.warn('!. bad or empty AddOrUpdateReport message not sent to SSE: %s' % message, exc_info=True)
             except:
@@ -832,7 +897,6 @@ class ui(sofabase):
 
         async def handleChangeReport(self, message):
             try:
-                #self.log.info('HCR')
                 await super().handleChangeReport(message)
                 if message:
                     try:
@@ -841,6 +905,20 @@ class ui(sofabase):
                         self.uiServer.add_sse_update(message)
                     except:
                         self.log.warn('!. bad or empty ChangeReport message not sent to SSE: %s' % message, exc_info=True)
+            except:
+                self.log.error('Error updating from change report', exc_info=True)
+
+
+        async def handleErrorResponse(self, message):
+            try:
+                await super().handleErrorResponse(message)
+                if message:
+                    try:
+                        if self.config.log_changes:
+                            self.log.info('-> SSE %s %s' % (message['event']['header']['name'],message))
+                        self.uiServer.add_sse_update(message)
+                    except:
+                        self.log.warn('!. bad or empty ErrorResponse message not sent to SSE: %s' % message, exc_info=True)
             except:
                 self.log.error('Error updating from change report', exc_info=True)
 
