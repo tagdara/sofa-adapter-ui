@@ -76,7 +76,7 @@ class Auth():
         self.JWT_EXP_DELTA_SECONDS = token_expires
         # TODO/CHEESE - Thumbnails should have security but some non-authenticated API such
         # as the homekit camera and jukebox may be using it
-        self.whitelist=['/eventgateway/activate','/list','/devices','/activate', '/client','/favicon.ico','/login','/logout','/thumbnail','/fonts']
+        self.whitelist=['/eventgateway/activate','/devices','/activate', '/client','/favicon.ico','/login','/logout','/thumbnail','/fonts']
         self.log=log
         self.instance_id=str(uuid.uuid1())
 
