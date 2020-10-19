@@ -66,7 +66,11 @@ class sofaWebUI():
             self.serverApp.router.add_get('/logout', self.logout_handler)
             self.serverApp.router.add_get('/directives', self.directivesHandler)
             self.serverApp.router.add_get('/events', self.eventsHandler)
+
+            self.serverApp.router.add_get('/layout/default', self.layoutStackDefaultHandler)
+            self.serverApp.router.add_get('/layout/stack/{item:.+}', self.layoutStackHandler)
             self.serverApp.router.add_get('/layout', self.layoutHandler)
+            
             self.serverApp.router.add_get('/properties', self.propertiesHandler)
             self.serverApp.router.add_get('/user', self.get_user)
             self.serverApp.router.add_post('/user/save', self.save_user)
@@ -164,15 +168,20 @@ class sofaWebUI():
             raise TypeError
 
 
-    async def layoutUpdate(self):
+    async def layoutUpdate(self, stack=None, default=False):
         try:
-            async with aiofiles.open(os.path.join(self.config.data_directory, 'layout.json'), mode='r') as f:
+            filename = os.path.join(self.config.data_directory, 'layout.json')
+            if stack:
+                filename=os.path.join(self.config.data_directory, 'stacks', '%s.json' % stack)
+            if default:
+                filename=os.path.join(self.config.data_directory, 'default-layout.json')
+            async with aiofiles.open(filename, mode='r') as f:
                 layout = await f.read()
                 return json.loads(layout)
         except concurrent.futures._base.CancelledError:
             self.log.error('!! Error getting layout data (cancelled)')
         except:
-            self.log.error('!! Error getting layout data', exc_info=True)
+            self.log.error('!! Error getting layout data: %s %s' % (stack, default), exc_info=True)
         return {}
 
     # URL Handlers
@@ -282,7 +291,23 @@ class sofaWebUI():
     async def layoutHandler(self, request):
         self.layout=await self.layoutUpdate()
         return self.json_response(self.layout)      
+
         
+    async def layoutStackHandler(self, request):
+        try:
+            self.layout=await self.layoutUpdate(stack=request.match_info['item'])
+            return self.json_response(self.layout)
+        except:
+            return {}
+
+    async def layoutStackDefaultHandler(self, request):
+        try:
+            self.layout=await self.layoutUpdate(default=True)
+            return self.json_response(self.layout)
+        except:
+            return {}
+
+
         
     async def propertiesHandler(self, request):
         
@@ -382,12 +407,16 @@ class sofaWebUI():
                 item=request.match_info['list']
                 source=item.split('/',1)[0] 
                 result='#'
+                headers = { 'authorization': self.dataset.token }
                 url = '%s/list/%s/%s' % (self.config.api_gateway, source, item.split('/',1)[1] )
                 self.log.info('>> Posting list request to %s %s' % (source, item.split('/',1)[1] ))
+                # timeout = aiohttp.ClientTimeout(total=self.adapterTimeout)
+                # list data can be pretty big so eliminating timeout for now
                 async with aiohttp.ClientSession() as client:
-                    async with client.post(url, data=body) as response:
+                    async with client.post(url, data=body, headers=headers) as response:
                         result=await response.read()
-                        result=result.decode()
+                        #result=result.decode()
+                        result=json.loads(result.decode())
             except:
                 self.log.error('Error transferring command: %s' % body,exc_info=True)
         
@@ -602,13 +631,13 @@ class sofaWebUI():
                 body=await request.read()
                 body=body.decode()
                 data=json.loads(body)
-                
                 if 'remove' in data and len(data['remove'])>0:
                     for item in data['remove']:
                         if item in self.session_device_filter[request.session]:    
                             self.session_device_filter[request.session].remove(item)
                 
                 if 'add' in data and len(data['add'])>0:
+                    self.log.info("<- %s/%s register %s devices" % (self.get_ip(request), request.user.login, len(data['add'])))
                     if request.session in self.session_device_filter:
                         for item in data['add']:
                             if item not in self.session_device_filter[request.session]:
@@ -638,8 +667,9 @@ class sofaWebUI():
                     getByAdapter[adapter].append(dev)
                     
                 gfa=[]
-
+                
                 results=await self.adapter.request_state_reports(devicelist)
+                self.log.info('<< received %s state reports' % len(results))
                 return results
                 devoutput={"event": { "header": { "name": "Multistate" }}, "state": {}}
                 for item in results:
@@ -887,6 +917,7 @@ class ui(sofabase):
                                 if dev['endpointId'] in self.uiServer.session_device_filter[session]:
                                     update_devs.append(dev['endpointId'])
                         if update_devs:
+                            self.log.info('.. requesting updated state for added and tracked devices: %s' % update_devs)
                             results=await self.request_state_reports(update_devs)
                             
                     except:
